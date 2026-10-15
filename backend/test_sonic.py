@@ -59,19 +59,23 @@ async def test_nova_sonic(wav_file: Path = None):
     
     nova_sonic = NovaSonicService(
         system_prompt="You are a helpful assistant. Listen to the user and respond naturally.",
-        enable_speaker=True,
-        inject_background_noise=True  # keeps stream alive during silent gaps in WAV playback
+        enable_speaker=True
     )
-    
+
     if nova_sonic.speaker:
         print("✓ Audio speaker initialized and ready\n")
     else:
         print("⚠️  Audio speaker not available\n")
-    
+
     # Start session
     print("Starting Nova Sonic session...")
     await nova_sonic.start_session()
     print("✓ Session started\n")
+
+    # Enable background noise injection to keep the stream alive during silent
+    # gaps between WAV chunks. Not used in the normal WebSocket path from main.py.
+    nova_sonic.start_background_noise()
+    print("✓ Background noise injection enabled\n")
     
     # Send WAV file (audio will be automatically played through speaker)
     print(f"Sending WAV file: {wav_file}")

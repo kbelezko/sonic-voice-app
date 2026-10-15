@@ -58,8 +58,7 @@ class NovaSonicService:
         system_prompt: str = None,
         mcp_tools=None,
         bedrock_service=None,
-        enable_speaker: bool = True,
-        inject_background_noise: bool = False
+        enable_speaker: bool = True
     ):
         self.model_id = os.environ["NOVA_SONIC_MODEL_ID"]
         self.region = os.environ["AWS_REGION"]
@@ -78,10 +77,9 @@ class NovaSonicService:
         # concurrent writes that produce malformed event blobs (ValidationException).
         self._send_lock = asyncio.Lock()
 
-        # Background noise injection: keeps the audio stream alive during silent gaps.
-        # Set True only for WAV file playback (test_sonic.py); the WebSocket path
-        # from a live browser microphone sends a continuous stream and does not need it.
-        self.inject_background_noise = inject_background_noise
+        # Background noise injection state.
+        # Off by default; call start_background_noise() to enable before sending audio.
+        self._noise_enabled = False
         self.background_noise_task = None
         self.active_content_name = None
 
@@ -257,6 +255,21 @@ class NovaSonicService:
 
         logger.info("Nova Sonic session started successfully")
 
+    def start_background_noise(self):
+        """
+        Enable background noise injection for the next audio content stream.
+
+        Call this after start_session() and before sending audio. The injection
+        task will start automatically when start_audio_content() is called.
+
+        Intended for WAV file playback (test_sonic.py) where silent gaps between
+        chunks would otherwise stall the stream. The normal WebSocket path in
+        main.py never calls this — the live microphone stream is continuous and
+        needs no filler.
+        """
+        self._noise_enabled = True
+        logger.info("Background noise injection enabled")
+
     async def start_audio_content(self) -> str:
         """Start audio input content stream and return content_name"""
         content_name = str(uuid.uuid4())
@@ -281,8 +294,8 @@ class NovaSonicService:
             }
         })
 
-        # Conditionally start background noise injection (WAV playback only).
-        if self.inject_background_noise:
+        # Start noise injection if enabled via start_background_noise().
+        if self._noise_enabled:
             self.active_content_name = content_name
             self.background_noise_task = asyncio.create_task(
                 self._inject_background_noise()
@@ -520,8 +533,10 @@ class NovaSonicService:
         """
         Periodically inject silence to keep the audio stream alive during gaps.
 
-        Used only when inject_background_noise=True (WAV file playback in test_sonic.py).
-        The browser microphone sends a continuous stream so this is not needed there.
+        Activated by calling start_background_noise() before sending audio.
+        Intended for WAV file playback (test_sonic.py) where silent gaps between
+        chunks would otherwise stall the stream. The browser microphone path in
+        main.py never calls start_background_noise(), so this task never runs there.
         All sends go through send_event() → _send_lock, so they cannot race with
         real audio sends.
         """
