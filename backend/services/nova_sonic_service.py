@@ -18,6 +18,22 @@ from .utils_speaker import AudioSpeaker, check_audio_playback_available
 
 logger = logging.getLogger(__name__)
 
+
+def _event_label(event_type: str, payload: dict) -> str:
+    """Return a human-readable label for an outbound event."""
+    if event_type == 'contentStart':
+        role = payload.get('role', '?')
+        ctype = payload.get('type', '?')
+        return f"contentStart ({role}/{ctype})"
+    if event_type == 'contentEnd':
+        name = payload.get('contentName', '')
+        short = f" [{name[:8]}…]" if name else ''
+        return f"contentEnd{short}"
+    if event_type == 'audioInput':
+        return 'audioInput'
+    return event_type
+
+
 # Audio configuration for Nova Sonic
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 16000
@@ -83,6 +99,9 @@ class NovaSonicService:
         self.background_noise_task = None
         self.active_content_name = None
 
+        # Counter for audioInput chunks — used in log labels.
+        self._audio_chunk_counter = 0
+
         # Initialize speaker component
         self.enable_speaker = enable_speaker and check_audio_playback_available()
         self.speaker = None
@@ -129,19 +148,40 @@ class NovaSonicService:
         logger.info(f"Nova Sonic client initialized for {self.region}")
 
     async def send_event(self, event: dict):
-        """Send an event to the bidirectional stream (serialised via _send_lock)"""
+        """Send an event to the bidirectional stream (serialised via _send_lock)."""
         if not self.stream:
             raise RuntimeError("Stream not initialized")
 
         event_type = next(iter(event['event'].keys()))
-        if event_type not in ['audioInput']:
-            logger.info(f'Sending: {event_type}')
+        payload = event['event'].get(event_type, {})
+        label = _event_label(event_type, payload)
+
+        if event_type == 'audioInput':
+            self._audio_chunk_counter += 1
+            logger.debug("→ Sending audioInput chunk #%d", self._audio_chunk_counter)
+        else:
+            logger.info("→ Sending %s", label)
+
+        logger.debug(
+            "  Payload:\n%s",
+            json.dumps(event, indent=2, ensure_ascii=False)
+        )
 
         chunk = InvokeModelWithBidirectionalStreamInputChunk(
             value=BidirectionalInputPayloadPart(bytes_=json.dumps(event).encode('utf-8'))
         )
-        async with self._send_lock:
-            await self.stream.input_stream.send(chunk)
+        try:
+            async with self._send_lock:
+                await self.stream.input_stream.send(chunk)
+        except Exception as e:
+            logger.error(
+                "❌ send_event failed on %s: %s\n"
+                "Full payload that caused the error:\n%s",
+                label, e,
+                json.dumps(event, indent=2, ensure_ascii=False),
+                exc_info=True
+            )
+            raise
 
     async def start_session(self, system_prompt: str = None):
         """Start a Nova Sonic session"""
@@ -473,8 +513,17 @@ class NovaSonicService:
                     if 'event' in json_data:
                         event_type = next(iter(json_data['event'].keys()))
 
+                        # DEBUG: every received event + full payload
+                        logger.debug("← Received: %s", event_type)
+                        if event_type not in ['audioOutput']:
+                            logger.debug(
+                                "  Response payload:\n%s",
+                                json.dumps(json_data, indent=2, ensure_ascii=False)
+                            )
+
+                        # INFO: only the non-noisy events
                         if event_type not in ['audioOutput', 'usageEvent']:
-                            logger.info(f"⭐ Received: {event_type}")
+                            logger.info("⭐ Received: %s", event_type)
 
                         # Queue event for WebSocket forwarding
                         await self.event_queue.put(json_data)
@@ -580,7 +629,7 @@ class NovaSonicService:
         tool_input = json.loads(tool_use['content'])
         tool_content_name = str(uuid.uuid4())
 
-        logger.info(f"Executing tool: {tool_name}")
+        logger.info("🔧 Tool call: %s | input: %s", tool_name, json.dumps(tool_input, ensure_ascii=False))
 
         try:
             # contentStart TOOL
@@ -602,6 +651,7 @@ class NovaSonicService:
             })
 
             result = self.mcp_tools.execute_tool(tool_name, tool_input)
+            logger.info("🔧 Tool result: %s | %s", tool_name, json.dumps(result, ensure_ascii=False)[:200])
 
             # toolResult
             await self.send_event({
@@ -624,7 +674,7 @@ class NovaSonicService:
                 }
             })
 
-            logger.info(f"Tool {tool_name} executed successfully")
+            logger.info("✅ Tool %s completed", tool_name)
 
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
