@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body, html { width: 100%; height: 100%; background: #111827; overflow: hidden; }
+    #avatar { width: 100%; height: 100%; }
+    #status {
+      position: absolute;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #6b7280;
+      font-family: system-ui, sans-serif;
+      font-size: 12px;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three":         "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js/+esm",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+      "talkinghead":   "https://cdn.jsdelivr.net/gh/met4citizen/TalkingHead@1.7/modules/talkinghead.mjs"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import { TalkingHead } from "talkinghead";
+
+    const HA_BASE = "https://cdn.jsdelivr.net/gh/met4citizen/HeadAudio@v0.1.0-alpha/dist";
+
+    let head     = null;
+    let audioCtx = null;
+    let endTimer = null; // debounce handle for streamNotifyEnd
+
+    const statusEl  = document.getElementById('status');
+    const setStatus = (t) => { statusEl.textContent = t; statusEl.style.display = t ? 'block' : 'none'; };
+
+    async function init() {
+      setStatus('Loading avatar…');
+
+      audioCtx = new AudioContext();
+
+      head = new TalkingHead(document.getElementById('avatar'), {
+        audioCtx,
+        cameraView:               'upper',
+        lipsyncModules:           ['en'],
+        avatarIdleEyeContact:     0.6,
+        avatarSpeakingEyeContact: 0.8,
+      });
+
+      // ── Load 3D avatar ────────────────────────────────────────────────────
+      try {
+        await head.showAvatar(
+          {
+            url:         'https://cdn.jsdelivr.net/gh/met4citizen/TalkingHead@1.7/avatars/brunette.glb',
+            body:        'F',
+            avatarMood:  'neutral',
+            lipsyncLang: 'en',
+          },
+          (ev) => {
+            if (ev.lengthComputable) {
+              setStatus(`Loading avatar… ${Math.round(ev.loaded / ev.total * 100)}%`);
+            }
+          }
+        );
+      } catch (err) {
+        setStatus('Avatar failed to load');
+        console.error('[avatar] showAvatar error:', err);
+        return;
+      }
+
+      setStatus('Loading lip-sync model…');
+
+      // ── HeadAudio: audio-driven real-time viseme detection ────────────────
+      // Taps head.audioSpeechGainNode → MFCC classifier → blend-shape values.
+      // Works with TalkingHead's streaming API (the audio flows through the
+      // same gain node regardless of how it was queued).
+      try {
+        await head.audioCtx.audioWorklet.addModule(`${HA_BASE}/headworklet.min.mjs`);
+
+        const mod = await import(`${HA_BASE}/headaudio.min.mjs`);
+        const Ctor = mod.HeadAudio ?? mod.HeadAudioNode ?? mod.default;
+        if (!Ctor) throw new Error('HeadAudio export not found in module');
+
+        const headaudio = new Ctor(head.audioCtx, {
+          parameterData: { vadGateActiveDb: -40, vadGateInactiveDb: -60 }
+        });
+
+        await headaudio.loadModel(`${HA_BASE}/model-en-mixed.bin`);
+
+        head.audioSpeechGainNode.connect(headaudio);
+
+        headaudio.onvalue = (key, value) => {
+          const morph = head.mtAvatar?.[key];
+          if (morph) Object.assign(morph, { newvalue: value, needsUpdate: true });
+        };
+
+        head.opt.update = headaudio.update.bind(headaudio);
+
+        console.info('[avatar] HeadAudio lip-sync ready');
+      } catch (err) {
+        console.warn('[avatar] HeadAudio init failed (idle only):', err);
+      }
+
+      // ── Start TalkingHead streaming session ───────────────────────────────
+      // streamStart uses an AudioWorklet for gapless, sample-accurate playback.
+      // Unlike speakAudio (which is a speech queue with natural pauses between
+      // items), streaming feeds a continuous PCM buffer — no gaps, no choppiness.
+      // The session stays open and reusable for the lifetime of the page.
+      try {
+        head.streamStart({ sampleRate: 16000 });
+        console.info('[avatar] streaming session started at 16 kHz');
+      } catch (err) {
+        console.error('[avatar] streamStart failed:', err);
+      }
+
+      setStatus('');
+    }
+
+    // ── Messages from the parent page ─────────────────────────────────────────
+    window.addEventListener('message', async (e) => {
+      if (!head) return;
+      const { type } = e.data ?? {};
+
+      if (type === 'pcmChunk' && e.data.buffer) {
+        // Resume AudioContext if blocked by browser autoplay policy
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+        // Feed raw Int16 PCM directly into TalkingHead's AudioWorklet —
+        // gapless streaming, no WAV decoding required here.
+        head.streamAudio({ audio: e.data.buffer });
+
+        // Debounce: signal end of utterance 400 ms after the last chunk
+        // so TalkingHead can return the avatar to idle.
+        clearTimeout(endTimer);
+        endTimer = setTimeout(() => head.streamNotifyEnd(), 400);
+      }
+
+      if (type === 'stop') {
+        clearTimeout(endTimer);
+        try { head.streamInterrupt(); } catch (_) {}
+      }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!head) return;
+      document.visibilityState === 'visible' ? head.start?.() : head.stop?.();
+    });
+
+    init();
+  </script>
+</head>
+<body>
+  <div id="avatar"></div>
+  <div id="status">Loading avatar…</div>
+</body>
+</html>

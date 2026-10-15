@@ -13,10 +13,24 @@ from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInp
 from aws_sdk_bedrock_runtime.config import AsyncBedrockRuntimeConfig
 from smithy_aws_core.identity import AWSCredentialsIdentity, StaticCredentialsResolver
 from smithy_http.aio.crt import AWSCRTHTTPClient
-from .utils_audio import check_audio_dependencies, pcm_to_wav_bytes
+from .utils_audio import pcm_to_wav_bytes
 from .utils_speaker import AudioSpeaker, check_audio_playback_available
+from .mcp_tools import MCPTools
+from repositories import HotelRepository, BookingRepository
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are a helpful hotel booking assistant. Help users find and book hotels through conversation.
+
+Your responsibilities:
+- Ask clarifying questions when needed (dates, location, number of guests)
+- Use the search_hotels tool to find available hotels
+- Use get_hotel_details to show detailed information about specific hotels
+- Use create_booking to complete reservations once you have all required information
+- Use get_booking to retrieve existing booking details
+- Use cancel_booking to cancel reservations
+
+Be conversational, friendly, and guide users through the booking process step by step. Always confirm important details before creating a booking."""
 
 
 def _event_label(event_type: str, payload: dict) -> str:
@@ -69,18 +83,10 @@ def get_aws_credentials_resolver():
 class NovaSonicService:
     """Service for AWS Bedrock Nova Sonic voice interactions"""
 
-    def __init__(
-        self,
-        system_prompt: str = None,
-        mcp_tools=None,
-        bedrock_service=None,
-        enable_speaker: bool = True
-    ):
+    def __init__(self):
         self.model_id = os.environ["NOVA_SONIC_MODEL_ID"]
         self.region = os.environ["AWS_REGION"]
-        self.system_prompt = system_prompt
-        self.mcp_tools = mcp_tools
-        self.bedrock_service = bedrock_service
+        self.mcp_tools = MCPTools(HotelRepository(), BookingRepository())
         self.client = None
         self.stream = None
         self.is_active = False
@@ -102,34 +108,9 @@ class NovaSonicService:
         # Counter for audioInput chunks — used in log labels.
         self._audio_chunk_counter = 0
 
-        # Initialize speaker component
-        self.enable_speaker = enable_speaker and check_audio_playback_available()
+        # Speaker is off by default. Call enable_speaker() to activate it
+        # for terminal/test mode. In WebUI mode the browser handles playback.
         self.speaker = None
-
-        if self.enable_speaker:
-            try:
-                self.speaker = AudioSpeaker(
-                    sample_rate=INPUT_SAMPLE_RATE,
-                    channels=CHANNELS,
-                    sample_width=2  # 16-bit
-                )
-                self.speaker.open()
-                self.speaker.start_playback_worker()
-                logger.info("Audio speaker initialized and ready")
-            except Exception as e:
-                logger.warning(f"Failed to initialize speaker: {e}")
-                self.speaker = None
-                self.enable_speaker = False
-        else:
-            logger.info("Audio speaker disabled or not available")
-
-        # Check audio processing capabilities
-        capabilities = check_audio_dependencies()
-        if not capabilities["soundfile"] or not capabilities["scipy"]:
-            logger.warning(
-                "Audio processing libraries not fully available. "
-                f"Capabilities: {capabilities}"
-            )
 
     async def _initialize_client(self):
         """Initialize the Bedrock Nova Sonic client"""
@@ -137,12 +118,10 @@ class NovaSonicService:
         if not credentials_resolver:
             raise RuntimeError("Unable to resolve AWS credentials")
 
-        transport = AWSCRTHTTPClient()
-
         config = await AsyncBedrockRuntimeConfig.resolve(
             region=self.region,
             aws_credentials_identity_resolver=credentials_resolver,
-            transport=transport
+            transport=AWSCRTHTTPClient()
         )
         self.client = AsyncBedrockRuntimeClient(config=config)
         logger.info(f"Nova Sonic client initialized for {self.region}")
@@ -183,13 +162,10 @@ class NovaSonicService:
             )
             raise
 
-    async def start_session(self, system_prompt: str = None):
+    async def start_session(self):
         """Start a Nova Sonic session"""
         if not self.client:
             await self._initialize_client()
-
-        if system_prompt is None:
-            system_prompt = self.system_prompt
 
         logger.info(f"Starting Nova Sonic session with model {self.model_id}")
 
@@ -227,7 +203,7 @@ class NovaSonicService:
                         "toolSpec": {
                             "name": tool["name"],
                             "description": tool["description"],
-                            "inputSchema": {"json": tool["input_schema"]}
+                            "inputSchema": {"json": json.dumps(tool["input_schema"])}
                         }
                     }
                     for tool in tools
@@ -258,40 +234,39 @@ class NovaSonicService:
         })
 
         # System prompt
-        if system_prompt:
-            content_name = str(uuid.uuid4())
+        content_name = str(uuid.uuid4())
 
-            await self.send_event({
-                "event": {
-                    "contentStart": {
-                        "promptName": self.prompt_name,
-                        "contentName": content_name,
-                        "type": "TEXT",
-                        "interactive": True,
-                        "role": "SYSTEM",
-                        "textInputConfiguration": {"mediaType": "text/plain"}
-                    }
+        await self.send_event({
+            "event": {
+                "contentStart": {
+                    "promptName": self.prompt_name,
+                    "contentName": content_name,
+                    "type": "TEXT",
+                    "interactive": False,
+                    "role": "SYSTEM",
+                    "textInputConfiguration": {"mediaType": "text/plain"}
                 }
-            })
+            }
+        })
 
-            await self.send_event({
-                "event": {
-                    "textInput": {
-                        "promptName": self.prompt_name,
-                        "contentName": content_name,
-                        "content": system_prompt
-                    }
+        await self.send_event({
+            "event": {
+                "textInput": {
+                    "promptName": self.prompt_name,
+                    "contentName": content_name,
+                    "content": SYSTEM_PROMPT
                 }
-            })
+            }
+        })
 
-            await self.send_event({
-                "event": {
-                    "contentEnd": {
-                        "promptName": self.prompt_name,
-                        "contentName": content_name
-                    }
+        await self.send_event({
+            "event": {
+                "contentEnd": {
+                    "promptName": self.prompt_name,
+                    "contentName": content_name
                 }
-            })
+            }
+        })
 
         logger.info("Nova Sonic session started successfully")
 
@@ -309,6 +284,30 @@ class NovaSonicService:
         """
         self._noise_enabled = True
         logger.info("Background noise injection enabled")
+
+    def enable_speaker(self):
+        """
+        Initialize and activate the local audio speaker for terminal/test mode.
+
+        Call this after creating the service when running test_sonic.py so that
+        Nova Sonic's audio output plays through the local speakers. Never call
+        this in the WebUI path — the browser handles playback there.
+        """
+        if not check_audio_playback_available():
+            logger.warning("Audio playback not available on this system")
+            return
+        try:
+            self.speaker = AudioSpeaker(
+                sample_rate=INPUT_SAMPLE_RATE,
+                channels=CHANNELS,
+                sample_width=2  # 16-bit
+            )
+            self.speaker.open()
+            self.speaker.start_playback_worker()
+            logger.info("Audio speaker initialized and ready")
+        except Exception as e:
+            logger.warning(f"Failed to initialize speaker: {e}")
+            self.speaker = None
 
     async def start_audio_content(self) -> str:
         """Start audio input content stream and return content_name"""

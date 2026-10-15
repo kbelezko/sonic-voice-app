@@ -36,7 +36,6 @@ async def test_nova_sonic(wav_file: Path = None):
     
     # Default WAV file if none provided
     if not wav_file:
-        # wav_file = Path("resources/can-t-help-me-mono-16KHz.wav")
         wav_file = Path("resources/how-are-you-doing-today-4.wav")
     else:
         wav_file = Path(wav_file)
@@ -57,10 +56,8 @@ async def test_nova_sonic(wav_file: Path = None):
     # Initialize Nova Sonic service (speaker enabled by default)
     print("Initializing Nova Sonic service...")
     
-    nova_sonic = NovaSonicService(
-        system_prompt="You are a helpful assistant. Listen to the user and respond naturally.",
-        enable_speaker=True
-    )
+    nova_sonic = NovaSonicService()
+    nova_sonic.enable_speaker()
 
     if nova_sonic.speaker:
         print("✓ Audio speaker initialized and ready\n")
