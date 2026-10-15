@@ -1,3 +1,7 @@
+# Backend resources (audio files) - keep only the test sample
+backend/resources/*
+!backend/resources/how-are-you-doing-today-4.wav
+
 # macOS
 .DS_Store
 .AppleDouble
@@ -20,7 +24,6 @@ venv/
 env/
 
 # Environment / secrets
-.env
 .env.*
 !.env.example
 
