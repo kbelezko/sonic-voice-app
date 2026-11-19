@@ -1,6 +1,12 @@
+
+
 # Hotel Booking Voice Chat
 
 Voice-first hotel booking demo using AWS Bedrock Nova Sonic for real-time speech-to-speech conversations.
+
+<p align="center">
+  <img src="docs/logo.png" width="80%" alt="Hotel Booking Voice Chat" />
+</p>
 
 ## Quick Start
 
